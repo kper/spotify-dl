@@ -5,7 +5,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use lazy_static::lazy_static;
 use librespot::core::session::Session;
-use librespot::core::spotify_id::SpotifyId;
+use librespot::core::SpotifyUri;
 use librespot::metadata::Metadata;
 use librespot::metadata::image::Image;
 use regex::Regex;
@@ -27,17 +27,12 @@ pub async fn get_tracks(spotify_ids: Vec<String>, session: &Session) -> Result<V
     for id in spotify_ids {
         tracing::debug!("Getting tracks for: {}", id);
         let id = parse_uri_or_url(&id).ok_or(anyhow::anyhow!("Invalid track"))?;
-        let new_tracks = match id.item_type {
-            librespot::core::spotify_id::SpotifyItemType::Track => vec![Track::from_id(id)],
-            librespot::core::spotify_id::SpotifyItemType::Episode => vec![Track::from_id(id)],
-            librespot::core::spotify_id::SpotifyItemType::Album => {
-                Album::from_id(id).get_tracks(session).await
-            }
-            librespot::core::spotify_id::SpotifyItemType::Playlist => {
-                Playlist::from_id(id).get_tracks(session).await
-            }
+        let new_tracks = match &id {
+            SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => vec![Track::from_id(id)],
+            SpotifyUri::Album { .. } => Album::from_id(id).get_tracks(session).await,
+            SpotifyUri::Playlist { .. } => Playlist::from_id(id).get_tracks(session).await,
             _ => {
-                tracing::warn!("Unsupported item type: {:?}", id.item_type);
+                tracing::warn!("Unsupported item type: {}", id.item_type());
                 vec![]
             }
         };
@@ -47,29 +42,29 @@ pub async fn get_tracks(spotify_ids: Vec<String>, session: &Session) -> Result<V
     Ok(tracks)
 }
 
-fn parse_uri_or_url(track: &str) -> Option<SpotifyId> {
+fn parse_uri_or_url(track: &str) -> Option<SpotifyUri> {
     parse_uri(track).or_else(|| parse_url(track))
 }
 
-fn parse_uri(track_uri: &str) -> Option<SpotifyId> {
-    let res = SpotifyId::from_uri(track_uri);
+fn parse_uri(track_uri: &str) -> Option<SpotifyUri> {
+    let res = SpotifyUri::from_uri(track_uri);
     tracing::info!("Parsed URI: {:?}", res);
     res.ok()
 }
 
-fn parse_url(track_url: &str) -> Option<SpotifyId> {
+fn parse_url(track_url: &str) -> Option<SpotifyUri> {
     let results = SPOTIFY_URL_REGEX.captures(track_url)?;
     let uri = format!(
         "spotify:{}:{}",
         results.get(1)?.as_str(),
         results.get(2)?.as_str()
     );
-    SpotifyId::from_uri(&uri).ok()
+    SpotifyUri::from_uri(&uri).ok()
 }
 
 #[derive(Clone, Debug)]
 pub struct Track {
-    pub id: SpotifyId,
+    pub id: SpotifyUri,
 }
 
 lazy_static! {
@@ -83,47 +78,43 @@ impl Track {
         Ok(Track { id })
     }
 
-    pub fn from_id(id: SpotifyId) -> Self {
+    pub fn from_id(id: SpotifyUri) -> Self {
         Track { id }
     }
 
     pub async fn metadata(&self, session: &Session) -> Result<TrackMetadata> {
-        let metadata = librespot::metadata::Track::get(session, &self.id)
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to get metadata"))?;
-
-        let mut artists = Vec::new();
-        for artist in metadata.artists.iter() {
-            artists.push(
-                librespot::metadata::Artist::get(session, &artist.id)
+        match &self.id {
+            SpotifyUri::Track { .. } => {
+                let metadata = librespot::metadata::Track::get(session, &self.id)
                     .await
-                    .map_err(|_| anyhow::anyhow!("Failed to get artist"))?,
-            );
+                    .map_err(|_| anyhow::anyhow!("Failed to get metadata"))?;
+
+                let mut artists = Vec::new();
+                for artist in metadata.artists.iter() {
+                    artists.push(
+                        librespot::metadata::Artist::get(session, &artist.id)
+                            .await
+                            .map_err(|_| anyhow::anyhow!("Failed to get artist"))?,
+                    );
+                }
+
+                let album = librespot::metadata::Album::get(session, &metadata.album.id)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Failed to get album"))?;
+
+                Ok(TrackMetadata::from_track(metadata, artists, album, session))
+            }
+            SpotifyUri::Episode { .. } => {
+                let metadata = librespot::metadata::Episode::get(session, &self.id)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Failed to get episode metadata"))?;
+                Ok(TrackMetadata::from_episode(metadata, session))
+            }
+            _ => Err(anyhow::anyhow!(
+                "Unsupported playable item type: {}",
+                self.id.item_type()
+            )),
         }
-
-        let album = librespot::metadata::Album::get(session, &metadata.album.id)
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to get album"))?;
-
-        let covers = album.covers.clone();
-        let session = session.clone();
-
-        let image_retriever: AsyncFn<Bytes> = Arc::new(move || {
-            let covers = covers.clone();
-            let session = session.clone();
-
-            Box::pin(async move {
-                let cover = covers.first()?;
-                session.spclient().get_image(&cover.id).await.ok()
-            })
-        });
-
-        Ok(TrackMetadata::from(
-            metadata,
-            artists,
-            album,
-            image_retriever,
-        ))
     }
 }
 
@@ -135,7 +126,7 @@ impl TrackCollection for Track {
 }
 
 pub struct Album {
-    id: SpotifyId,
+    id: SpotifyUri,
 }
 
 impl Album {
@@ -144,11 +135,11 @@ impl Album {
         Ok(Album { id })
     }
 
-    pub fn from_id(id: SpotifyId) -> Self {
+    pub fn from_id(id: SpotifyUri) -> Self {
         Album { id }
     }
 
-    pub async fn is_album(id: SpotifyId, session: &Session) -> bool {
+    pub async fn is_album(id: SpotifyUri, session: &Session) -> bool {
         librespot::metadata::Album::get(session, &id).await.is_ok()
     }
 }
@@ -159,12 +150,16 @@ impl TrackCollection for Album {
         let album = librespot::metadata::Album::get(session, &self.id)
             .await
             .expect("Failed to get album");
-        album.tracks().map(|track| Track::from_id(*track)).collect()
+        album
+            .tracks()
+            .cloned()
+            .map(Track::from_id)
+            .collect()
     }
 }
 
 pub struct Playlist {
-    id: SpotifyId,
+    id: SpotifyUri,
 }
 
 impl Playlist {
@@ -173,11 +168,11 @@ impl Playlist {
         Ok(Playlist { id })
     }
 
-    pub fn from_id(id: SpotifyId) -> Self {
+    pub fn from_id(id: SpotifyUri) -> Self {
         Playlist { id }
     }
 
-    pub async fn is_playlist(id: SpotifyId, session: &Session) -> bool {
+    pub async fn is_playlist(id: SpotifyUri, session: &Session) -> bool {
         librespot::metadata::Playlist::get(session, &id)
             .await
             .is_ok()
@@ -192,7 +187,8 @@ impl TrackCollection for Playlist {
             .expect("Failed to get playlist");
         playlist
             .tracks()
-            .map(|track| Track::from_id(*track))
+            .cloned()
+            .map(Track::from_id)
             .collect()
     }
 }
@@ -207,12 +203,14 @@ pub struct TrackMetadata {
 }
 
 impl TrackMetadata {
-    pub fn from(
+    pub fn from_track(
         track: librespot::metadata::Track,
         artists: Vec<librespot::metadata::Artist>,
         album: librespot::metadata::Album,
-        image_retriever: AsyncFn<Bytes>,
+        session: &Session,
     ) -> Self {
+        let covers = album.covers.to_vec();
+        let image_retriever = build_image_retriever(covers, session);
         let artists = artists
             .iter()
             .map(|artist| ArtistMetadata::from(artist.clone()))
@@ -223,6 +221,23 @@ impl TrackMetadata {
             artists,
             track_name: track.name.clone(),
             album,
+            duration: track.duration,
+            image_retriever,
+        }
+    }
+
+    pub fn from_episode(track: librespot::metadata::Episode, session: &Session) -> Self {
+        let image_retriever = build_image_retriever(track.covers.to_vec(), session);
+
+        TrackMetadata {
+            artists: vec![ArtistMetadata {
+                name: track.show_name.clone(),
+            }],
+            track_name: track.name.clone(),
+            album: AlbumMetadata {
+                name: track.show_name.clone(),
+                cover: track.covers.first().cloned(),
+            },
             duration: track.duration,
             image_retriever,
         }
@@ -300,4 +315,18 @@ impl From<librespot::metadata::Album> for AlbumMetadata {
             cover: album.covers.first().cloned(),
         }
     }
+}
+
+fn build_image_retriever(covers: Vec<Image>, session: &Session) -> AsyncFn<Bytes> {
+    let session = session.clone();
+
+    Arc::new(move || {
+        let covers = covers.clone();
+        let session = session.clone();
+
+        Box::pin(async move {
+            let cover = covers.first()?;
+            session.spclient().get_image(&cover.id).await.ok()
+        })
+    })
 }
