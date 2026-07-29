@@ -12,6 +12,10 @@ use crate::stream::channel_sink::{ChannelSink, SinkEvent};
 use crate::stream::{StreamError, StreamEvent, StreamEventChannel};
 use crate::track::Track;
 
+const TRACK_LOAD_RETRIES: u32 = 6;
+const TRACK_LOAD_BASE_BACKOFF_SECS: u64 = 10;
+const TRACK_LOAD_MAX_BACKOFF_SECS: u64 = 120;
+
 pub struct Stream {
     player_config: PlayerConfig,
     session: Session,
@@ -44,7 +48,7 @@ impl Stream {
 
         tokio::spawn(async move {
             match tryhard::retry_fn(|| async { Self::load(player.clone(), &track).await })
-                .retries(3)
+                .retries(TRACK_LOAD_RETRIES)
                 .on_retry(|attempt, _, e| {
                     let error = format!("{}", e);
                     let tx = tx.clone();
@@ -58,12 +62,12 @@ impl Stream {
                         );
                         Self::send_event(&tx, StreamEvent::Retry {
                             attempt: attempt as usize,
-                            max_attempts: 3,
+                            max_attempts: TRACK_LOAD_RETRIES as usize,
                         }).await;
                     }
                 })
-                .exponential_backoff(Duration::from_secs(10))
-                .max_delay(Duration::from_secs(30))
+                .exponential_backoff(Duration::from_secs(TRACK_LOAD_BASE_BACKOFF_SECS))
+                .max_delay(Duration::from_secs(TRACK_LOAD_MAX_BACKOFF_SECS))
                 .await
             {
                 Ok(_) => tracing::info!("Track loaded successfully: {:?}", track_id),
@@ -72,8 +76,8 @@ impl Stream {
                     Self::send_event(
                         &tx,
                         StreamEvent::Error(StreamError::LoadError(format!(
-                            "Failed to load track: {:?}",
-                            track_id
+                            "Failed to load track {:?}: {}",
+                            track_id, e
                         ))),
                     )
                     .await;

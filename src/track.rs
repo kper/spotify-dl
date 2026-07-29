@@ -1,8 +1,11 @@
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
+use librespot::core::error::{Error as LibrespotError, ErrorKind as LibrespotErrorKind};
 use lazy_static::lazy_static;
 use librespot::core::session::Session;
 use librespot::core::SpotifyUri;
@@ -16,9 +19,12 @@ use crate::utils::clean_invalid_characters;
 pub type AsyncFn<T> =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<T>> + Send>> + Send + Sync>;
 
+const METADATA_MAX_RETRIES: usize = 5;
+const METADATA_RETRY_BASE_DELAY_MS: u64 = 750;
+
 #[async_trait::async_trait]
 trait TrackCollection {
-    async fn get_tracks(&self, session: &Session) -> Vec<Track>;
+    async fn get_tracks(&self, session: &Session) -> Result<Vec<Track>>;
 }
 
 #[tracing::instrument(name = "get_tracks", skip(session), level = "debug")]
@@ -29,8 +35,8 @@ pub async fn get_tracks(spotify_ids: Vec<String>, session: &Session) -> Result<V
         let id = parse_uri_or_url(&id).ok_or(anyhow::anyhow!("Invalid track"))?;
         let new_tracks = match &id {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => vec![Track::from_id(id)],
-            SpotifyUri::Album { .. } => Album::from_id(id).get_tracks(session).await,
-            SpotifyUri::Playlist { .. } => Playlist::from_id(id).get_tracks(session).await,
+            SpotifyUri::Album { .. } => Album::from_id(id).get_tracks(session).await?,
+            SpotifyUri::Playlist { .. } => Playlist::from_id(id).get_tracks(session).await?,
             _ => {
                 tracing::warn!("Unsupported item type: {}", id.item_type());
                 vec![]
@@ -85,29 +91,54 @@ impl Track {
     pub async fn metadata(&self, session: &Session) -> Result<TrackMetadata> {
         match &self.id {
             SpotifyUri::Track { .. } => {
-                let metadata = librespot::metadata::Track::get(session, &self.id)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Failed to get metadata"))?;
+                let metadata = retry_metadata_request(
+                    || librespot::metadata::Track::get(session, &self.id),
+                    format!("track metadata for {}", self.id),
+                )
+                .await
+                    .with_context(|| format!("failed to get track metadata for {}", self.id))?;
 
                 let mut artists = Vec::new();
                 for artist in metadata.artists.iter() {
                     artists.push(
-                        librespot::metadata::Artist::get(session, &artist.id)
-                            .await
-                            .map_err(|_| anyhow::anyhow!("Failed to get artist"))?,
+                        retry_metadata_request(
+                            || librespot::metadata::Artist::get(session, &artist.id),
+                            format!("artist metadata for {} while resolving track {}", artist.id, self.id),
+                        )
+                        .await
+                            .with_context(|| {
+                                format!(
+                                    "failed to get artist metadata for {} while resolving track {}",
+                                    artist.id, self.id
+                                )
+                            })?,
                     );
                 }
 
-                let album = librespot::metadata::Album::get(session, &metadata.album.id)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Failed to get album"))?;
+                let album = retry_metadata_request(
+                    || librespot::metadata::Album::get(session, &metadata.album.id),
+                    format!(
+                        "album metadata for {} while resolving track {}",
+                        metadata.album.id, self.id
+                    ),
+                )
+                .await
+                    .with_context(|| {
+                        format!(
+                            "failed to get album metadata for {} while resolving track {}",
+                            metadata.album.id, self.id
+                        )
+                    })?;
 
                 Ok(TrackMetadata::from_track(metadata, artists, album, session))
             }
             SpotifyUri::Episode { .. } => {
-                let metadata = librespot::metadata::Episode::get(session, &self.id)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Failed to get episode metadata"))?;
+                let metadata = retry_metadata_request(
+                    || librespot::metadata::Episode::get(session, &self.id),
+                    format!("episode metadata for {}", self.id),
+                )
+                .await
+                    .with_context(|| format!("failed to get episode metadata for {}", self.id))?;
                 Ok(TrackMetadata::from_episode(metadata, session))
             }
             _ => Err(anyhow::anyhow!(
@@ -120,8 +151,8 @@ impl Track {
 
 #[async_trait::async_trait]
 impl TrackCollection for Track {
-    async fn get_tracks(&self, _session: &Session) -> Vec<Track> {
-        vec![self.clone()]
+    async fn get_tracks(&self, _session: &Session) -> Result<Vec<Track>> {
+        Ok(vec![self.clone()])
     }
 }
 
@@ -140,21 +171,29 @@ impl Album {
     }
 
     pub async fn is_album(id: SpotifyUri, session: &Session) -> bool {
-        librespot::metadata::Album::get(session, &id).await.is_ok()
+        retry_metadata_request(
+            || librespot::metadata::Album::get(session, &id),
+            format!("album metadata for {}", id),
+        )
+        .await
+        .is_ok()
     }
 }
 
 #[async_trait::async_trait]
 impl TrackCollection for Album {
-    async fn get_tracks(&self, session: &Session) -> Vec<Track> {
-        let album = librespot::metadata::Album::get(session, &self.id)
-            .await
-            .expect("Failed to get album");
-        album
+    async fn get_tracks(&self, session: &Session) -> Result<Vec<Track>> {
+        let album = retry_metadata_request(
+            || librespot::metadata::Album::get(session, &self.id),
+            format!("album metadata for {}", self.id),
+        )
+        .await
+            .with_context(|| format!("failed to get album metadata for {}", self.id))?;
+        Ok(album
             .tracks()
             .cloned()
             .map(Track::from_id)
-            .collect()
+            .collect())
     }
 }
 
@@ -173,23 +212,29 @@ impl Playlist {
     }
 
     pub async fn is_playlist(id: SpotifyUri, session: &Session) -> bool {
-        librespot::metadata::Playlist::get(session, &id)
-            .await
-            .is_ok()
+        retry_metadata_request(
+            || librespot::metadata::Playlist::get(session, &id),
+            format!("playlist metadata for {}", id),
+        )
+        .await
+        .is_ok()
     }
 }
 
 #[async_trait::async_trait]
 impl TrackCollection for Playlist {
-    async fn get_tracks(&self, session: &Session) -> Vec<Track> {
-        let playlist = librespot::metadata::Playlist::get(session, &self.id)
-            .await
-            .expect("Failed to get playlist");
-        playlist
+    async fn get_tracks(&self, session: &Session) -> Result<Vec<Track>> {
+        let playlist = retry_metadata_request(
+            || librespot::metadata::Playlist::get(session, &self.id),
+            format!("playlist metadata for {}", self.id),
+        )
+        .await
+            .with_context(|| format!("failed to get playlist metadata for {}", self.id))?;
+        Ok(playlist
             .tracks()
             .cloned()
             .map(Track::from_id)
-            .collect()
+            .collect())
     }
 }
 
@@ -329,4 +374,56 @@ fn build_image_retriever(covers: Vec<Image>, session: &Session) -> AsyncFn<Bytes
             session.spclient().get_image(&cover.id).await.ok()
         })
     })
+}
+
+async fn retry_metadata_request<T, F, Fut>(
+    mut request: F,
+    operation: String,
+) -> std::result::Result<T, LibrespotError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<T, LibrespotError>>,
+{
+    let mut attempt = 0;
+
+    loop {
+        match request().await {
+            Ok(value) => return Ok(value),
+            Err(err) if should_retry_metadata_error(&err) && attempt < METADATA_MAX_RETRIES => {
+                attempt += 1;
+                let delay_ms = METADATA_RETRY_BASE_DELAY_MS * (1_u64 << (attempt - 1));
+                tracing::warn!(
+                    "Retrying {} after {} (attempt {}/{}) in {}ms",
+                    operation,
+                    describe_librespot_error(&err),
+                    attempt,
+                    METADATA_MAX_RETRIES,
+                    delay_ms
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(err) => {
+                if should_retry_metadata_error(&err) {
+                    tracing::error!(
+                        "Exhausted metadata retries for {} after {} attempts: {}",
+                        operation,
+                        METADATA_MAX_RETRIES,
+                        describe_librespot_error(&err)
+                    );
+                }
+                return Err(err);
+            }
+        }
+    }
+}
+
+fn should_retry_metadata_error(err: &LibrespotError) -> bool {
+    matches!(
+        err.kind,
+        LibrespotErrorKind::ResourceExhausted | LibrespotErrorKind::Unavailable
+    )
+}
+
+fn describe_librespot_error(err: &LibrespotError) -> String {
+    format!("{} {{ {} }}", err.kind, err.error)
 }

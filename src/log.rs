@@ -73,6 +73,8 @@ pub fn configure_logger() -> Result<()> {
 
     let targets = filter::Targets::new()
         .with_target("spotify_dl", tracing::Level::DEBUG)
+        .with_target("librespot", tracing::Level::DEBUG)
+        .with_target("librespot_core", tracing::Level::TRACE)
         .with_default(LevelFilter::OFF);
 
     let console_layer = fmt::layer().with_target(false).with_filter(
@@ -81,10 +83,16 @@ pub fn configure_logger() -> Result<()> {
             .from_env_lossy(),
     );
 
+    let file_targets = filter::Targets::new()
+        .with_target("spotify_dl", tracing::Level::DEBUG)
+        .with_target("librespot", tracing::Level::DEBUG)
+        .with_target("librespot_core", tracing::Level::TRACE)
+        .with_default(LevelFilter::INFO);
+
     let file_layer = fmt::layer()
         .with_writer(non_blocking)
         .with_ansi(false)
-        .with_filter(EnvFilter::new("info"));
+        .with_filter(file_targets);
 
     Registry::default()
         .with(console_layer)
